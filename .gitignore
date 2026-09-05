@@ -1,0 +1,56 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# =========================
+# Virtual environments
+# =========================
+.venv/
+venv/
+env/
+
+# =========================
+# Environment / secrets
+# =========================
+.env
+.env.*
+
+# =========================
+# AI / model artifacts
+# =========================
+*.pt
+*.pth
+*.onnx
+*.weights
+
+# YOLO generated outputs
+runs/
+outputs/
+
+# =========================
+# Local datasets / recordings
+# =========================
+data/
+*.mp4
+*.avi
+*.mov
+
+# =========================
+# IDE / OS
+# =========================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# =========================
+# Logs / temporary files
+# =========================
+*.log
+*.tmp
