@@ -1,27 +1,21 @@
-"""Minimal YOLO person detection test on the live webcam feed."""
+"""Real-time YOLO person detection with persistent ByteTrack IDs on the live webcam feed."""
 
 import time
 
 import cv2
-import torch
-from ultralytics import YOLO
 
-PERSON_CLASS_ID = 0  # COCO class index for "person"
-MODEL_PATH = "yolov8n.pt"
+from person_detector import PersonDetector, get_device
+from person_tracker import PersonTracker
+
 WARMUP_FRAMES = 10
 
 
-def get_device():
-    return "cuda" if torch.cuda.is_available() else "cpu"
-
-
-def draw_detections(frame, results):
-    for box in results.boxes:
-        x1, y1, x2, y2 = map(int, box.xyxy[0])
-        confidence = float(box.conf[0])
+def draw_tracks(frame, tracked_people):
+    for person in tracked_people:
+        x1, y1, x2, y2 = person.bbox
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        label = f"person {confidence:.2f}"
+        label = f"Person ID {person.track_id} | {person.confidence:.2f}"
         cv2.putText(
             frame, label, (x1, max(y1 - 10, 0)),
             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
@@ -57,7 +51,8 @@ def main():
     device = get_device()
     print(f"Using device: {device}")
 
-    model = YOLO(MODEL_PATH)
+    detector = PersonDetector(device=device)
+    tracker = PersonTracker()
 
     cap = cv2.VideoCapture(0)
 
@@ -77,16 +72,14 @@ def main():
             print("Error: could not read frame from webcam.")
             break
 
-        results = model.predict(
-            frame, classes=[PERSON_CLASS_ID], device=device, verbose=False,
-        )[0]
+        boxes = detector.detect(frame)
+        tracked_people = tracker.update(boxes, frame)
 
-        draw_detections(frame, results)
+        draw_tracks(frame, tracked_people)
 
         current_time = time.time()
         fps = 1.0 / (current_time - prev_time)
         prev_time = current_time
-        draw_fps(frame, fps)
 
         frame_index += 1
         if frame_index > WARMUP_FRAMES:
