@@ -23,6 +23,21 @@ def draw_tracks(frame, tracked_people):
         )
 
 
+def draw_raw_detections(frame, boxes):
+    """Diagnostic-only overlay of raw YOLO boxes, separate from tracked boxes.
+
+    Purely visual - does not read from or affect the tracker.
+    """
+    for bbox, confidence in zip(boxes.xyxy, boxes.conf):
+        x1, y1, x2, y2 = map(int, bbox)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 1)
+        label = f"RAW YOLO {float(confidence):.2f}"
+        cv2.putText(
+            frame, label, (x1, min(y2 + 15, frame.shape[0] - 5)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1,
+        )
+
+
 def draw_fps(frame, fps):
     cv2.putText(
         frame, f"FPS: {fps:.1f}", (10, 30),
@@ -78,6 +93,7 @@ def main():
         tracked_people = tracker.update(boxes, frame)
 
         draw_tracks(frame, tracked_people)
+        draw_raw_detections(frame, boxes)
 
         current_time = time.time()
         fps = 1.0 / (current_time - prev_time)

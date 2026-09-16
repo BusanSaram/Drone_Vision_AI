@@ -80,6 +80,9 @@ class TrackingDiagnostics:
         if events:
             self._print_history(events)
 
+        if yolo_count >= 2:
+            self._print_multi_detection_geometry(frame_index, boxes, frame_height, track_ids)
+
         self._prev_yolo_count = yolo_count
         self._prev_track_ids = set(track_ids)
         self._prev_track_confidence = track_confidence
@@ -125,6 +128,65 @@ class TrackingDiagnostics:
                 )
 
         return events
+
+    def _print_multi_detection_geometry(self, frame_index, boxes, frame_height, track_ids) -> None:
+        """Dump raw per-detection bbox geometry and pairwise IoU when YOLO reports >= 2 person detections.
+
+        Diagnostic-only: reads `boxes` (a `Boxes`-like object) without modifying it,
+        and does not feed its output back into detection or tracking in any way.
+        """
+        print("\n--- Multiple YOLO person detections ---")
+        print(f"Frame: {frame_index}")
+
+        detections = []
+        for i, (bbox, confidence) in enumerate(zip(boxes.xyxy, boxes.conf)):
+            x1, y1, x2, y2 = (float(v) for v in bbox)
+            width = x2 - x1
+            height = y2 - y1
+            bbox_height_ratio = height / frame_height
+            detections.append((x1, y1, x2, y2, width, height))
+            print(
+                f"\nDetection {i}\n"
+                f"confidence: {float(confidence):.2f}\n"
+                f"bbox: ({x1:.1f}, {y1:.1f}, {x2:.1f}, {y2:.1f})\n"
+                f"width: {width:.1f}\n"
+                f"height: {height:.1f}\n"
+                f"bbox_height_ratio: {bbox_height_ratio:.2f}"
+            )
+
+        print()
+        for i in range(len(detections)):
+            for j in range(i + 1, len(detections)):
+                iou = self._iou(detections[i], detections[j])
+                print(f"IoU(det{i}, det{j}): {iou:.2f}")
+
+        track_desc = ", ".join(str(t) for t in track_ids) or "none"
+        print(f"\nActive Track IDs: {track_desc}")
+        print("----------------------------------------\n")
+
+    @staticmethod
+    def _iou(box_a, box_b) -> float:
+        """Standard bounding-box IoU: intersection_area / (area_a + area_b - intersection_area).
+
+        Diagnostic-only helper; not used by detection or tracking logic.
+        """
+        ax1, ay1, ax2, ay2, aw, ah = box_a
+        bx1, by1, bx2, by2, bw, bh = box_b
+
+        inter_x1 = max(ax1, bx1)
+        inter_y1 = max(ay1, by1)
+        inter_x2 = min(ax2, bx2)
+        inter_y2 = min(ay2, by2)
+
+        inter_width = max(0.0, inter_x2 - inter_x1)
+        inter_height = max(0.0, inter_y2 - inter_y1)
+        intersection_area = inter_width * inter_height
+
+        area_a = aw * ah
+        area_b = bw * bh
+        union_area = area_a + area_b - intersection_area
+
+        return intersection_area / union_area if union_area > 0 else 0.0
 
     def _print_history(self, events: list[str]) -> None:
         print("\n--- Tracking diagnostic event ---")
