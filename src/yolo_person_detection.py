@@ -6,6 +6,7 @@ import cv2
 
 from person_detector import PersonDetector, get_device
 from person_tracker import PersonTracker
+from tracking_diagnostics import TrackingDiagnostics
 
 WARMUP_FRAMES = 10
 
@@ -53,6 +54,7 @@ def main():
 
     detector = PersonDetector(device=device)
     tracker = PersonTracker()
+    diagnostics = TrackingDiagnostics()
 
     cap = cv2.VideoCapture(0)
 
@@ -86,6 +88,8 @@ def main():
             if start_time is None:
                 start_time = current_time
             fps_values.append(fps)
+
+        diagnostics.observe(frame_index, boxes, tracked_people, frame.shape[0])
 
         cv2.imshow("YOLO Person Detection", frame)
 
