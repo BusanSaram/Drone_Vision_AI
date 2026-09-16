@@ -1,20 +1,21 @@
 """Assigns persistent IDs to per-frame person detections.
 
-Wraps Ultralytics' built-in BYTETracker (the same tracker used internally
-by `model.track()`), used directly here instead so that detection and
-tracking stay as separate, independently swappable stages. This module
-only depends on a `Boxes`-like object (conf, xywh, xyxy, cls, boolean
-indexing) - not on how the detections were produced - so it keeps working
-unchanged if the detector backend changes later.
+Wraps Ultralytics' built-in BOTSORT tracker (BoT-SORT with ReID disabled;
+`with_reid: False` in the bundled config), used directly here instead of
+`model.track()` so that detection and tracking stay as separate,
+independently swappable stages. This module only depends on a
+`Boxes`-like object (conf, xywh, xyxy, cls, boolean indexing) - not on how
+the detections were produced - so it keeps working unchanged if the
+detector backend changes later.
 """
 
 from dataclasses import dataclass
 
-from ultralytics.trackers.byte_tracker import BYTETracker
+from ultralytics.trackers.bot_sort import BOTSORT
 from ultralytics.utils import YAML, IterableSimpleNamespace
 from ultralytics.utils.checks import check_yaml
 
-DEFAULT_TRACKER_CONFIG = "bytetrack.yaml"  # bundled with Ultralytics
+DEFAULT_TRACKER_CONFIG = "botsort.yaml"  # bundled with Ultralytics; with_reid is False by default
 
 
 @dataclass
@@ -25,12 +26,12 @@ class TrackedPerson:
 
 
 class PersonTracker:
-    """Wraps Ultralytics' BYTETracker to produce persistent person IDs."""
+    """Wraps Ultralytics' BOTSORT tracker to produce persistent person IDs."""
 
     def __init__(self, tracker_config: str = DEFAULT_TRACKER_CONFIG):
         cfg_path = check_yaml(tracker_config)
         cfg = IterableSimpleNamespace(**YAML.load(cfg_path))
-        self._tracker = BYTETracker(args=cfg)
+        self._tracker = BOTSORT(args=cfg)
 
     def update(self, boxes, frame) -> list[TrackedPerson]:
         """Match this frame's detections against existing tracks.
@@ -38,8 +39,9 @@ class PersonTracker:
         Args:
             boxes: `Boxes`-like detections for the current frame (see
                 `PersonDetector.detect`).
-            frame: The current BGR frame (used by some trackers for motion
-                compensation; unused by plain ByteTrack).
+            frame: The current BGR frame. BoT-SORT uses this for its
+                global motion compensation (GMC) step, which the previous
+                ByteTrack backend did not use.
 
         Returns:
             One `TrackedPerson` per confirmed track this frame.

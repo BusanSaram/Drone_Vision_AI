@@ -1,4 +1,4 @@
-"""Real-time YOLO person detection with persistent ByteTrack IDs on the live webcam feed."""
+"""Real-time YOLO person detection with persistent BoT-SORT IDs on the live webcam feed."""
 
 import time
 
