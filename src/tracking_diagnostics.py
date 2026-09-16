@@ -20,6 +20,8 @@ HISTORY_LEN = 20  # rolling window of recent frames kept for event dumps
 CONFIDENCE_DROP_THRESHOLD = 0.15
 BBOX_SCALE_CHANGE_THRESHOLD = 0.15
 
+NEW_TRACK_CONTEXT_FRAMES = 10  # previous frames to dump alongside the triggering frame
+
 
 @dataclass
 class FrameRecord:
@@ -27,6 +29,10 @@ class FrameRecord:
     yolo_confidences: list[float] = field(default_factory=list)
     yolo_bbox_scales: list[float] = field(default_factory=list)
     track_ids: list[int] = field(default_factory=list)
+    # Raw per-detection geometry: (x1, y1, x2, y2, width, height). Kept so a
+    # brand-new-track event can reprint full historical geometry on demand
+    # without needing to have retained the original `Boxes` objects.
+    yolo_boxes: list[tuple[float, float, float, float, float, float]] = field(default_factory=list)
 
 
 class TrackingDiagnostics:
@@ -37,16 +43,26 @@ class TrackingDiagnostics:
         history_len: int = HISTORY_LEN,
         confidence_drop_threshold: float = CONFIDENCE_DROP_THRESHOLD,
         bbox_scale_change_threshold: float = BBOX_SCALE_CHANGE_THRESHOLD,
+        new_track_thresh: float | None = None,
     ):
         self._history: deque[FrameRecord] = deque(maxlen=history_len)
         self._confidence_drop_threshold = confidence_drop_threshold
         self._bbox_scale_change_threshold = bbox_scale_change_threshold
+        # For display only, in the "NEW TRACK CREATED" event - not used in any
+        # calculation. Lets the log state which new_track_thresh was running
+        # when a given track was first created.
+        self._new_track_thresh_label = new_track_thresh
 
         self._prev_yolo_count = 0
         self._prev_track_ids: set[int] = set()
         self._prev_track_confidence: dict[int, float] = {}
         self._prev_track_bbox_scale: dict[int, float] = {}
         self._ever_seen_ids: set[int] = set()
+        # Persistent, always-populated record of every ID's first-observed frame,
+        # independent of terminal scrollback - queryable/printable at any time,
+        # e.g. at program exit, so a NEW TRACK CREATED event is never unrecoverable
+        # even if its live print scrolled out of view mid-session.
+        self._first_seen_frame: dict[int, int] = {}
 
     def observe(self, frame_index, boxes, tracked_people, frame_height: int) -> None:
         """Record one frame of detector + tracker output and log any notable events.
@@ -61,9 +77,11 @@ class TrackingDiagnostics:
         """
         yolo_count = len(boxes)
         yolo_confidences = [float(c) for c in boxes.conf] if yolo_count else []
-        yolo_bbox_scales = (
-            [float((y2 - y1) / frame_height) for _, y1, _, y2 in boxes.xyxy] if yolo_count else []
-        )
+        yolo_boxes = []
+        for (x1, y1, x2, y2) in (boxes.xyxy if yolo_count else []):
+            x1, y1, x2, y2 = float(x1), float(y1), float(x2), float(y2)
+            yolo_boxes.append((x1, y1, x2, y2, x2 - x1, y2 - y1))
+        yolo_bbox_scales = [box[5] / frame_height for box in yolo_boxes]
 
         track_ids = [p.track_id for p in tracked_people]
         track_confidence = {p.track_id: p.confidence for p in tracked_people}
@@ -71,7 +89,9 @@ class TrackingDiagnostics:
             p.track_id: (p.bbox[3] - p.bbox[1]) / frame_height for p in tracked_people
         }
 
-        self._history.append(FrameRecord(frame_index, yolo_confidences, yolo_bbox_scales, track_ids))
+        self._history.append(
+            FrameRecord(frame_index, yolo_confidences, yolo_bbox_scales, track_ids, yolo_boxes)
+        )
 
         events = self._detect_events(
             yolo_count, track_ids, track_confidence, track_bbox_scale,
@@ -82,6 +102,18 @@ class TrackingDiagnostics:
 
         if yolo_count >= 2:
             self._print_multi_detection_geometry(frame_index, boxes, frame_height, track_ids)
+
+        # First-ever appearance of each track ID this session: captured here
+        # (before _ever_seen_ids is updated below) so we can log exactly what
+        # raw detection(s) were on screen at the moment a brand new ID was created.
+        brand_new_ids = set(track_ids) - self._ever_seen_ids
+        if brand_new_ids:
+            people_by_id = {p.track_id: p for p in tracked_people}
+            for track_id in sorted(brand_new_ids):
+                self._first_seen_frame[track_id] = frame_index
+                self._print_new_track_created(
+                    frame_index, people_by_id[track_id], boxes, frame_height, track_ids,
+                )
 
         self._prev_yolo_count = yolo_count
         self._prev_track_ids = set(track_ids)
@@ -162,7 +194,112 @@ class TrackingDiagnostics:
 
         track_desc = ", ".join(str(t) for t in track_ids) or "none"
         print(f"\nActive Track IDs: {track_desc}")
-        print("----------------------------------------\n")
+        print("----------------------------------------\n", flush=True)
+
+    def _print_frame_geometry(self, record: FrameRecord) -> None:
+        """Print one frame's raw YOLO detections plus pairwise IoU/edge-gap/axis-overlap.
+
+        Diagnostic-only: reads a `FrameRecord` snapshot, computes nothing that
+        feeds back into detection or tracking.
+        """
+        print(f"\nFrame {record.frame_index}")
+        if not record.yolo_boxes:
+            print("  No RAW YOLO person detections.")
+
+        for i, (x1, y1, x2, y2, width, height) in enumerate(record.yolo_boxes):
+            print(
+                f"  Detection {i}: confidence={record.yolo_confidences[i]:.2f}, "
+                f"bbox=({x1:.1f}, {y1:.1f}, {x2:.1f}, {y2:.1f}), width={width:.1f}, height={height:.1f}"
+            )
+
+        for i in range(len(record.yolo_boxes)):
+            for j in range(i + 1, len(record.yolo_boxes)):
+                box_i, box_j = record.yolo_boxes[i], record.yolo_boxes[j]
+                iou = self._iou(box_i, box_j)
+                h_gap, v_gap = self._edge_gaps(box_i, box_j)
+                print(
+                    f"  IoU(det{i}, det{j})={iou:.2f} | "
+                    f"horizontal edge gap={h_gap:.1f}px | vertical edge gap={v_gap:.1f}px "
+                    f"(negative = overlapping by that many px, positive = separated by that many px) | "
+                    f"overlap on X axis={h_gap < 0} | overlap on Y axis={v_gap < 0}"
+                )
+
+        track_desc = ", ".join(str(t) for t in record.track_ids) or "none"
+        print(f"  Active Track IDs: {track_desc}")
+
+    @staticmethod
+    def _edge_gaps(box_a, box_b) -> tuple[float, float]:
+        """Signed horizontal/vertical edge gap between two (x1,y1,x2,y2,w,h) boxes.
+
+        Negative = the boxes overlap on that axis by that many pixels.
+        Positive = the boxes are separated on that axis by that many pixels.
+        Zero = the edges exactly touch. Diagnostic-only; not used by tracking logic.
+        """
+        ax1, ay1, ax2, ay2 = box_a[:4]
+        bx1, by1, bx2, by2 = box_b[:4]
+        horizontal_gap = max(ax1, bx1) - min(ax2, bx2)
+        vertical_gap = max(ay1, by1) - min(ay2, by2)
+        return horizontal_gap, vertical_gap
+
+    def _print_new_track_created(self, frame_index, new_person, boxes, frame_height, track_ids) -> None:
+        """Log the first-ever appearance of a track ID: the previous
+        `NEW_TRACK_CONTEXT_FRAMES` frames plus the current one (raw detections,
+        pairwise IoU, pairwise edge gaps, axis overlap, active track IDs), then
+        the triggering frame's new-track-specific analysis.
+
+        This identifies the best *geometric* match only - the tracker API does not expose
+        which raw detection it actually used internally, so the result is reported as a
+        "likely source detection", not a confirmed one.
+        """
+        context = list(self._history)[-(NEW_TRACK_CONTEXT_FRAMES + 1):]
+        print(
+            f"\n=== NEW TRACK CREATED: {len(context)}-frame context "
+            f"(up to {NEW_TRACK_CONTEXT_FRAMES} previous + current) ==="
+        )
+        for record in context:
+            self._print_frame_geometry(record)
+
+        x1, y1, x2, y2 = new_person.bbox
+        track_box = (float(x1), float(y1), float(x2), float(y2), float(x2 - x1), float(y2 - y1))
+
+        print("\n--- NEW TRACK CREATED ---")
+        print(f"Frame: {frame_index}")
+        print(f"New Track ID: {new_person.track_id}")
+        print(f"Track confidence: {new_person.confidence:.2f}")
+        print(f"Track bbox: ({x1}, {y1}, {x2}, {y2})")
+
+        print("\nCandidate source detections (edge distance is between this detection and the new track's bbox):")
+        best_index, best_iou, best_confidence = None, -1.0, None
+        for i, (bbox, confidence) in enumerate(zip(boxes.xyxy, boxes.conf)):
+            dx1, dy1, dx2, dy2 = (float(v) for v in bbox)
+            width, height = dx2 - dx1, dy2 - dy1
+            bbox_height_ratio = height / frame_height
+            det_box = (dx1, dy1, dx2, dy2, width, height)
+            iou = self._iou(track_box, det_box)
+            h_gap, v_gap = self._edge_gaps(track_box, det_box)
+            print(
+                f"Detection {i}: confidence={float(confidence):.2f}, "
+                f"bbox=({dx1:.1f}, {dy1:.1f}, {dx2:.1f}, {dy2:.1f}), "
+                f"width={width:.1f}, height={height:.1f}, bbox_height_ratio={bbox_height_ratio:.2f}, "
+                f"IoU with track={iou:.2f}, horizontal edge gap={h_gap:.1f}px, vertical edge gap={v_gap:.1f}px"
+            )
+            if iou > best_iou:
+                best_index, best_iou, best_confidence = i, iou, float(confidence)
+
+        print("\nBest matching source detection (best geometric match by IoU;")
+        print("not confirmed as BoT-SORT's actual internal association source):")
+        if best_index is not None:
+            print(f"Detection index: {best_index}")
+            print(f"Detection confidence: {best_confidence:.2f}")
+            print(f"IoU: {best_iou:.2f}")
+        else:
+            print("No raw YOLO detections available this frame to compare against.")
+
+        track_desc = ", ".join(str(t) for t in track_ids) or "none"
+        print(f"\nActive Track IDs: {track_desc}")
+        if self._new_track_thresh_label is not None:
+            print(f"Runtime new_track_thresh: {self._new_track_thresh_label}")
+        print("-------------------------\n", flush=True)
 
     @staticmethod
     def _iou(box_a, box_b) -> float:
@@ -201,4 +338,21 @@ class TrackingDiagnostics:
                 f"YOLO: {yolo_desc} (n={len(record.yolo_confidences)}, conf=[{conf_desc}], scale=[{scale_desc}]) | "
                 f"Track IDs: {track_desc}"
             )
-        print("--- end diagnostic event ---\n")
+        print("--- end diagnostic event ---\n", flush=True)
+
+    def print_first_appearance_summary(self) -> None:
+        """Print every track ID's first-observed frame number.
+
+        This is a persistent, always-populated record (see `_first_seen_frame`),
+        independent of terminal scrollback - intended to be called once at
+        program exit so a track's first appearance is never unrecoverable even
+        if its live "--- NEW TRACK CREATED ---" print scrolled out of view
+        during a long session.
+        """
+        print("\n--- First appearance summary (all track IDs this session) ---")
+        if not self._first_seen_frame:
+            print("No track IDs were observed.")
+        else:
+            for track_id in sorted(self._first_seen_frame):
+                print(f"Track ID {track_id}: first observed at frame {self._first_seen_frame[track_id]}")
+        print("--- end first appearance summary ---\n", flush=True)

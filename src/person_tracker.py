@@ -28,9 +28,11 @@ class TrackedPerson:
 class PersonTracker:
     """Wraps Ultralytics' BOTSORT tracker to produce persistent person IDs."""
 
-    def __init__(self, tracker_config: str = DEFAULT_TRACKER_CONFIG):
+    def __init__(self, tracker_config: str = DEFAULT_TRACKER_CONFIG, new_track_thresh: float | None = None):
         cfg_path = check_yaml(tracker_config)
         cfg = IterableSimpleNamespace(**YAML.load(cfg_path))
+        if new_track_thresh is not None:
+            cfg.new_track_thresh = new_track_thresh
         self._tracker = BOTSORT(args=cfg)
 
     def update(self, boxes, frame) -> list[TrackedPerson]:
