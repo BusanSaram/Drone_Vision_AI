@@ -27,9 +27,11 @@ class TrackedPerson:
 class PersonTracker:
     """Wraps Ultralytics' BYTETracker to produce persistent person IDs."""
 
-    def __init__(self, tracker_config: str = DEFAULT_TRACKER_CONFIG):
+    def __init__(self, tracker_config: str = DEFAULT_TRACKER_CONFIG, track_buffer: int | None = None):
         cfg_path = check_yaml(tracker_config)
         cfg = IterableSimpleNamespace(**YAML.load(cfg_path))
+        if track_buffer is not None:
+            cfg.track_buffer = track_buffer
         self._tracker = BYTETracker(args=cfg)
 
     def update(self, boxes, frame) -> list[TrackedPerson]:

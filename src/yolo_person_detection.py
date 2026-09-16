@@ -9,6 +9,11 @@ from person_tracker import PersonTracker
 
 WARMUP_FRAMES = 10
 
+# ByteTrack: frames to keep a lost track alive before dropping its ID.
+# None = Ultralytics default (30, from bytetrack.yaml). Set to an int to
+# experiment with longer short-term ID retention.
+TRACK_BUFFER = 90
+
 
 def draw_tracks(frame, tracked_people):
     for person in tracked_people:
@@ -52,7 +57,7 @@ def main():
     print(f"Using device: {device}")
 
     detector = PersonDetector(device=device)
-    tracker = PersonTracker()
+    tracker = PersonTracker(track_buffer=TRACK_BUFFER)
 
     cap = cv2.VideoCapture(0)
 
