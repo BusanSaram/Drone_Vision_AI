@@ -28,6 +28,7 @@ env/
 *.pth
 *.onnx
 *.weights
+*.task
 
 # YOLO generated outputs
 runs/

@@ -3,3 +3,13 @@ opencv-python
 ultralytics
 torch
 lap
+
+# Gesture recognition (hand landmarks / gestures). Installed with --no-deps
+# to avoid pulling in opencv-contrib-python, which would conflict with
+# opencv-python above (both install into the same `cv2` namespace). The
+# packages below are mediapipe's real runtime deps besides cv2/numpy, which
+# this project already provides.
+mediapipe
+absl-py
+sounddevice
+flatbuffers
