@@ -12,16 +12,22 @@ from proximity_diagnostics import ProximityDiagnostics, nearest_confirmed_relati
 
 WARMUP_FRAMES = 10
 
+# Verbose per-frame/per-event diagnostic logging (multi-detection geometry,
+# bbox/IoU dumps, tracking fragmentation events, proximity diagnostics, FPS
+# min/max, first-appearance summary). Off by default so normal runs only
+# print the end-of-run summaries; set True to bring it back for debugging.
+DEBUG = False
+
 # BoT-SORT: minimum confidence required to START a new track (does not
 # affect association with existing tracks). None = Ultralytics default
 # (0.25, from botsort.yaml). Experimenting with a higher value to test
 # whether it suppresses false tracks from low-confidence spurious
-# detections while a single real person is in frame.
-NEW_TRACK_THRESH = 0.50
+# detections while a single real person is in frame. Not a final tuned
+# value - still experimental.
+NEW_TRACK_THRESH = 0.8
 
 CANDIDATE_COLOR = (0, 165, 255)  # orange (BGR)
 CONFIRMED_COLOR = (255, 255, 0)  # cyan (BGR)
-BLOCKED_COLOR = (0, 0, 255)  # red (BGR)
 
 
 def draw_tracks(frame, tracked_people):
@@ -58,15 +64,12 @@ def draw_validation_labels(frame, validated_tracks):
     `draw_tracks`, so raw tracker output stays visible for debugging.
     """
     for validated in validated_tracks:
-        x1, y1, _x2, y2 = validated.tracked_person.bbox
+        x1, y1, _x2, _y2 = validated.tracked_person.bbox
         track_id = validated.tracked_person.track_id
 
         if validated.state is TrackState.CONFIRMED:
             label = f"Person ID {track_id} | CONFIRMED"
             color = CONFIRMED_COLOR
-        elif validated.state is TrackState.CONFIRMATION_BLOCKED:
-            label = f"ID {track_id} | CONFIRMATION BLOCKED"
-            color = BLOCKED_COLOR
         else:
             label = f"ID {track_id} | CANDIDATE"
             color = CANDIDATE_COLOR
@@ -75,18 +78,6 @@ def draw_validation_labels(frame, validated_tracks):
             frame, label, (x1, max(y1 - 30, 15)),
             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2,
         )
-
-        if validated.state is TrackState.CONFIRMATION_BLOCKED and validated.block_info is not None:
-            info = validated.block_info
-            reason = (
-                f"near confirmed ID {info['confirmed_id']} | "
-                f"h_gap_ratio={info['horizontal_gap_ratio']:.2f} | "
-                f"v_overlap_ratio={info['vertical_overlap_ratio']:.2f} | IoU={info['iou']:.2f}"
-            )
-            cv2.putText(
-                frame, reason, (x1, min(y2 + 35, frame.shape[0] - 5)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, BLOCKED_COLOR, 1,
-            )
 
 
 def draw_proximity_hints(frame, validated_tracks):
@@ -121,7 +112,7 @@ def draw_fps(frame, fps):
 def print_performance_summary(start_time, end_time, fps_values):
     frame_count = len(fps_values)
 
-    print("\n--- Performance Summary (post warm-up) ---")
+    print("--- Performance Summary ---")
 
     if frame_count == 0:
         print("No frames were measured (fewer than "
@@ -130,10 +121,11 @@ def print_performance_summary(start_time, end_time, fps_values):
 
     duration = end_time - start_time
     print(f"Test duration: {duration:.2f} s")
-    print(f"Total measured frames: {frame_count}")
+    print(f"Total frames: {frame_count}")
     print(f"Average FPS: {sum(fps_values) / frame_count:.2f}")
-    print(f"Min FPS: {min(fps_values):.2f}")
-    print(f"Max FPS: {max(fps_values):.2f}")
+    if DEBUG:
+        print(f"Min FPS: {min(fps_values):.2f}")
+        print(f"Max FPS: {max(fps_values):.2f}")
 
 
 def main():
@@ -143,7 +135,7 @@ def main():
     detector = PersonDetector(device=device)
     tracker = PersonTracker(new_track_thresh=NEW_TRACK_THRESH)
     diagnostics = TrackingDiagnostics(new_track_thresh=NEW_TRACK_THRESH)
-    validator = TrackValidator(confirmation_time=CONFIRMATION_TIME, lost_grace_time=LOST_GRACE_TIME)
+    validator = TrackValidator(confirmation_time=CONFIRMATION_TIME, lost_grace_time=LOST_GRACE_TIME, debug=DEBUG)
     proximity_diagnostics = ProximityDiagnostics()
 
     cap = cv2.VideoCapture(0)
@@ -168,7 +160,8 @@ def main():
         tracked_people = tracker.update(boxes, frame)
         now = time.time()
         validated_tracks = validator.update(tracked_people, now)
-        proximity_diagnostics.observe(now, boxes, validated_tracks, frame.shape[1], frame.shape[0])
+        if DEBUG:
+            proximity_diagnostics.observe(now, boxes, validated_tracks, frame.shape[1], frame.shape[0])
 
         draw_tracks(frame, tracked_people)
         draw_raw_detections(frame, boxes)
@@ -185,7 +178,8 @@ def main():
                 start_time = current_time
             fps_values.append(fps)
 
-        diagnostics.observe(frame_index, boxes, tracked_people, frame.shape[0])
+        if DEBUG:
+            diagnostics.observe(frame_index, boxes, tracked_people, frame.shape[0])
 
         cv2.imshow("YOLO Person Detection", frame)
 
@@ -198,7 +192,8 @@ def main():
     cv2.destroyAllWindows()
 
     print_performance_summary(start_time, end_time, fps_values)
-    diagnostics.print_first_appearance_summary()
+    if DEBUG:
+        diagnostics.print_first_appearance_summary()
     validator.print_summary()
 
 
