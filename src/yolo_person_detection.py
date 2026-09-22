@@ -6,9 +6,9 @@ import cv2
 
 from person_detector import PersonDetector, get_device
 from person_tracker import PersonTracker
-from tracking_diagnostics import TrackingDiagnostics
 from track_validator import CONFIRMATION_TIME, LOST_GRACE_TIME, TrackState, TrackValidator
-from proximity_diagnostics import ProximityDiagnostics, nearest_confirmed_relationship
+from diagnostics.tracking_diagnostics import TrackingDiagnostics
+from diagnostics.proximity_diagnostics import ProximityDiagnostics, nearest_confirmed_relationship
 
 WARMUP_FRAMES = 10
 
