@@ -1,5 +1,7 @@
 # Drone Vision AI
 
+[한국어](README.md) | [English](README.en.md)
+
 드론 영상 기반 컴퓨터 비전 프로젝트 (ECE Senior Design / AI Product — 사람을 인식하고 따라가는 person-following 드론).
 
 ## AI Pipeline (전체 목표)
