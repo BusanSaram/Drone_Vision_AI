@@ -85,9 +85,7 @@ def main():
             draw_hand(frame, hand, frame_width, frame_height)
 
         current_time = time.time()
-        fps = 1.0 / (current_time - prev_time)
         prev_time = current_time
-        draw_fps(frame, fps)
 
         cv2.imshow("Gesture Recognition Test", frame)
 
