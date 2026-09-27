@@ -4,7 +4,8 @@ ultralytics
 torch
 lap
 
-# Gesture recognition (hand landmarks / gestures). Installed with --no-deps
+# MediaPipe - kept for the PLANNED MediaPipe Pose stage (not implemented yet;
+# no MediaPipe code currently exists in src/). Installed with --no-deps
 # to avoid pulling in opencv-contrib-python, which would conflict with
 # opencv-python above (both install into the same `cv2` namespace). The
 # packages below are mediapipe's real runtime deps besides cv2/numpy, which

@@ -222,7 +222,7 @@ class TrackValidator:
 def confirmed_only(validated_tracks: list[ValidatedTrack]) -> list[TrackedPerson]:
     """Filter to just the TrackedPerson objects currently CONFIRMED.
 
-    This is the clean interface future stages (gesture recognition, target
+    This is the clean interface future stages (body-pose recognition, target
     selection, etc.) would consume - not called by them yet, since those
     stages are not implemented in this experiment.
     """
