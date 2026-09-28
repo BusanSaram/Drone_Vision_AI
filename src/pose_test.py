@@ -50,11 +50,11 @@ LANDMARK_COLOR = (0, 255, 0)  # green (BGR)
 CONNECTION_COLOR = (255, 255, 0)  # cyan (BGR)
 
 
-def create_landmarker() -> PoseLandmarker:
+def create_landmarker(num_poses: int = NUM_POSES) -> PoseLandmarker:
     options = PoseLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=MODEL_PATH),
         running_mode=RunningMode.VIDEO,
-        num_poses=NUM_POSES,
+        num_poses=num_poses,
         min_pose_detection_confidence=MIN_POSE_DETECTION_CONFIDENCE,
         min_pose_presence_confidence=MIN_POSE_PRESENCE_CONFIDENCE,
         min_tracking_confidence=MIN_TRACKING_CONFIDENCE,
