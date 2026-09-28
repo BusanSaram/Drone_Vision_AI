@@ -23,6 +23,10 @@ class TrackedPerson:
     track_id: int
     bbox: tuple[int, int, int, int]  # x1, y1, x2, y2
     confidence: float
+    # Row of this frame's detections that updated the track (BoT-SORT's
+    # `det_idx`). Lets per-detection data such as pose keypoints follow the
+    # track; see keypoint_track_association.py.
+    detection_index: int | None = None
 
 
 class PersonTracker:
@@ -51,12 +55,13 @@ class PersonTracker:
         tracks = self._tracker.update(boxes, frame)
 
         tracked_people = []
-        for x1, y1, x2, y2, track_id, confidence, _cls, _det_idx in tracks:
+        for x1, y1, x2, y2, track_id, confidence, _cls, det_idx in tracks:
             tracked_people.append(
                 TrackedPerson(
                     track_id=int(track_id),
                     bbox=(int(x1), int(y1), int(x2), int(y2)),
                     confidence=float(confidence),
+                    detection_index=int(det_idx),
                 )
             )
         return tracked_people
