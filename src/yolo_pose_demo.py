@@ -6,29 +6,38 @@ Pipeline:
            -> PersonTracker (BoT-SORT, same config as yolo_person_detection.py)
            -> TrackValidator (CANDIDATE / CONFIRMED)
            -> match_tracks_to_detections() (track_id -> this frame's keypoints)
+           -> classify_pose() per CONFIRMED track -> raw pose
+           -> TrackPoseStabilizers (0.7 s hold + short NONE grace, one per track ID) -> command
            -> OpenCV visualization
 
 Tracker and validator settings are identical to the detection-only baseline
 (`yolo_person_detection.py`) so the two can be compared directly. Only the
 detector model differs.
 
-Display: CONFIRMED tracks get bbox, "ID n | CONFIRMED | conf x.xx" and their
-skeleton; CANDIDATE tracks get bbox and label only. Top-left shows smoothed
+Display: CONFIRMED tracks get bbox, "ID n | CONFIRMED | conf x.xx", their
+skeleton, "Raw Pose: ..." and "Command: ..." (with hold progress while a pose
+is being held, and "[NONE grace]" while a NONE dropout is tolerated);
+CANDIDATE tracks get bbox and label only. A CONFIRMED track with no
+keypoints this frame counts as raw pose NONE. Top-left shows smoothed
 FPS, the number of YOLO Pose detections and the number of CONFIRMED tracks.
 Per-stage rolling timings are printed to the console every
 PRINT_INTERVAL seconds; run-average timings and FPS are printed on exit.
 
-No body-pose commands, target selection or drone control here.
+Commands are display labels only: nothing selects a target, follows anyone,
+or talks to a drone.
 """
 
 import time
 
 import cv2
+import numpy as np
 
 from coco_keypoints import KEYPOINT_CONF_THRESHOLD, reliable_mask, skeleton_segments
+from coco_pose_recognizer import POSE_TO_COMMAND, BodyPose, classify_pose
 from keypoint_track_association import match_tracks_to_detections
 from person_detector import get_device
 from person_tracker import PersonTracker
+from pose_command_stabilizer import TrackPoseStabilizers
 from rolling_stats import FpsMeter, StageTimer
 from track_validator import CONFIRMATION_TIME, LOST_GRACE_TIME, TrackState, TrackValidator
 from yolo_person_detection import NEW_TRACK_THRESH, WARMUP_FRAMES
@@ -37,12 +46,16 @@ from yolo_pose_detector import YoloPoseDetector
 ROLLING_WINDOW = 30  # frames
 PRINT_INTERVAL = 2.0  # seconds between console timing lines
 
-STAGES = ("pose_inference", "tracking", "validation", "association", "drawing", "total")
+STAGES = ("pose_inference", "tracking", "validation", "association", "pose_commands", "drawing", "total")
+LABEL_LINE_HEIGHT = 22  # px between stacked per-track label lines
 
 CONFIRMED_COLOR = (255, 255, 0)  # cyan (BGR)
 CANDIDATE_COLOR = (0, 165, 255)  # orange (BGR)
 KEYPOINT_COLOR = (0, 255, 0)  # green (BGR)
 STATUS_COLOR = (0, 0, 255)  # red (BGR)
+
+WINDOW_NAME = "YOLOv8n-Pose Tracking"
+INITIAL_WINDOW_SIZE = (1280, 720)  # display only; camera and inference resolution are unchanged
 
 
 def draw_skeleton(frame, keypoints, color, min_conf=KEYPOINT_CONF_THRESHOLD):
@@ -55,13 +68,26 @@ def draw_skeleton(frame, keypoints, color, min_conf=KEYPOINT_CONF_THRESHOLD):
             cv2.circle(frame, point, 4, KEYPOINT_COLOR, -1)
 
 
-def draw_track(frame, validated):
+def pose_label_lines(state, hold_time) -> list[str]:
+    """'Raw Pose' / 'Command' lines for one track's StabilizerState."""
+    command = POSE_TO_COMMAND[state.active].value
+    if state.active is BodyPose.NONE and state.candidate is not BodyPose.NONE:
+        command += f" (hold {min(state.held_for, hold_time):.2f}/{hold_time:.2f}s)"
+    if state.in_grace:
+        command += " [NONE grace]"
+    return [f"Raw Pose: {state.raw_pose.value}", f"Command: {command}"]
+
+
+def draw_track(frame, validated, extra_lines=()):
+    """Bbox plus stacked label lines above it: ID/state/conf first, then `extra_lines`."""
     person = validated.tracked_person
     x1, y1, x2, y2 = person.bbox
     color = CONFIRMED_COLOR if validated.state is TrackState.CONFIRMED else CANDIDATE_COLOR
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-    label = f"ID {person.track_id} | {validated.state.value} | conf {person.confidence:.2f}"
-    cv2.putText(frame, label, (x1, max(y1 - 10, 15)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    lines = [f"ID {person.track_id} | {validated.state.value} | conf {person.confidence:.2f}", *extra_lines]
+    top = max(y1 - 10 - LABEL_LINE_HEIGHT * (len(lines) - 1), 15)
+    for i, line in enumerate(lines):
+        cv2.putText(frame, line, (x1, top + LABEL_LINE_HEIGHT * i), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
 
 def draw_status(frame, fps, num_detections, num_confirmed):
@@ -69,6 +95,24 @@ def draw_status(frame, fps, num_detections, num_confirmed):
     lines = [fps_text, f"Pose detections: {num_detections}", f"Confirmed tracks: {num_confirmed}"]
     for i, line in enumerate(lines):
         cv2.putText(frame, line, (10, 30 + 30 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.8, STATUS_COLOR, 2)
+
+
+def fit_to_window(frame, window_size):
+    """Scale `frame` to fit `window_size` (w, h) without distortion, padding with black.
+
+    Display only: the window may have any shape, so the frame is scaled by the
+    smaller of the two ratios and centered (letterboxed) instead of stretched.
+    """
+    win_w, win_h = window_size
+    if win_w <= 0 or win_h <= 0:  # minimized / window not available
+        return frame
+    h, w = frame.shape[:2]
+    scale = min(win_w / w, win_h / h)
+    new_w, new_h = max(1, round(w * scale)), max(1, round(h * scale))
+    canvas = np.zeros((win_h, win_w, 3), dtype=frame.dtype)
+    x, y = (win_w - new_w) // 2, (win_h - new_h) // 2
+    canvas[y:y + new_h, x:x + new_w] = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    return canvas
 
 
 def format_timings(timings_ms) -> str:
@@ -82,6 +126,7 @@ def main():
     detector = YoloPoseDetector(device=device)
     tracker = PersonTracker(new_track_thresh=NEW_TRACK_THRESH)
     validator = TrackValidator(confirmation_time=CONFIRMATION_TIME, lost_grace_time=LOST_GRACE_TIME)
+    stabilizers = TrackPoseStabilizers()
     timer = StageTimer(window=ROLLING_WINDOW)
     fps_meter = FpsMeter(window=ROLLING_WINDOW)
 
@@ -89,6 +134,10 @@ def main():
     if not cap.isOpened():
         print("Error: could not open webcam.")
         return
+
+    # Resizable display window; the user can resize/maximize it freely.
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_NAME, *INITIAL_WINDOW_SIZE)
 
     frame_index = 0
     last_print = time.perf_counter()
@@ -124,24 +173,44 @@ def main():
             with timer.measure("association"):
                 track_to_detection = match_tracks_to_detections(tracked_people, detections)
 
-            with timer.measure("drawing"):
-                num_confirmed = 0
+            # Per-track raw pose + hold. Only CONFIRMED tracks are eligible; a
+            # confirmed track without keypoints this frame counts as NONE.
+            with timer.measure("pose_commands"):
+                pose_now = time.monotonic()
+                pose_states = {}
                 for validated in validated_tracks:
-                    draw_track(frame, validated)
                     if validated.state is not TrackState.CONFIRMED:
                         continue
-                    num_confirmed += 1
-                    index = track_to_detection.get(validated.tracked_person.track_id)
+                    track_id = validated.tracked_person.track_id
+                    index = track_to_detection.get(track_id)
+                    raw_pose = BodyPose.NONE if index is None else classify_pose(detections.keypoints[index])
+                    state = stabilizers.update(track_id, raw_pose, pose_now)
+                    pose_states[track_id] = state
+                    if state.newly_activated:
+                        print(f"Track {track_id} command: {POSE_TO_COMMAND[state.active].value} "
+                              f"({state.active.value}) - display only", flush=True)
+                stabilizers.prune(pose_states)
+
+            with timer.measure("drawing"):
+                for validated in validated_tracks:
+                    track_id = validated.tracked_person.track_id
+                    state = pose_states.get(track_id)
+                    if state is None:  # CANDIDATE
+                        draw_track(frame, validated)
+                        continue
+                    draw_track(frame, validated, pose_label_lines(state, stabilizers.hold_time))
+                    index = track_to_detection.get(track_id)
                     if index is not None:
                         draw_skeleton(frame, detections.keypoints[index], CONFIRMED_COLOR)
-                draw_status(frame, fps, len(detections), num_confirmed)
+                draw_status(frame, fps, len(detections), len(pose_states))
 
         if now - last_print >= PRINT_INTERVAL:
             fps_text = "-" if fps is None else f"{fps:.1f}"
             print(f"[rolling {ROLLING_WINDOW}f] FPS {fps_text} | {format_timings(timer.rolling_ms())}", flush=True)
             last_print = now
 
-        cv2.imshow("YOLOv8n-Pose Tracking", frame)
+        _x, _y, win_w, win_h = cv2.getWindowImageRect(WINDOW_NAME)
+        cv2.imshow(WINDOW_NAME, fit_to_window(frame, (win_w, win_h)))
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
