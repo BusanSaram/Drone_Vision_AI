@@ -27,8 +27,8 @@ Camera
   → YOLOv8n Person Detection      [IMPLEMENTED]
   → BoT-SORT Person Tracking      [IMPLEMENTED]
   → Track Validation              [IMPLEMENTED]
-  → MediaPipe Pose                [PLANNED / NOT IMPLEMENTED]
-  → Body-Pose Recognition         [PLANNED]
+  → MediaPipe Pose                [STANDALONE TEST ONLY / NOT INTEGRATED]
+  → Body-Pose Recognition         [STANDALONE TEST ONLY / NOT INTEGRATED]
   → Pose-to-Person Association    [PLANNED]
   → Target Selection              [PLANNED]
   → Person-Following Control      [PLANNED]
@@ -53,8 +53,8 @@ Planned onboard hardware (not implemented): Raspberry Pi 5 (4GB), Sony IMX500 AI
 | Person Detection (YOLOv8n) | ✅ DONE |
 | Person Tracking (BoT-SORT) | ✅ BASELINE ESTABLISHED |
 | Track Validation (CANDIDATE → CONFIRMED) | ✅ BASELINE ESTABLISHED |
-| MediaPipe Pose | ⬜ Not implemented (NEXT) |
-| Body-Pose Recognition | ⬜ Not implemented |
+| MediaPipe Pose | 🔧 Standalone webcam test (`pose_test.py`), not integrated with tracking |
+| Body-Pose Recognition | 🔧 Standalone (`body_pose_recognizer.py` + hold-time stabilizer), shown in `pose_test.py`; visual labels only, not integrated |
 | Pose-to-Person Association | ⬜ Not implemented |
 | Target Selection | ⬜ Not implemented |
 | Person-Following Control | ⬜ Not implemented |
@@ -74,6 +74,9 @@ src/
 ├── person_tracker.py         # BoT-SORT tracking → persistent track ID
 ├── track_validator.py        # CANDIDATE/CONFIRMED state management
 ├── yolo_person_detection.py  # person detection + tracking integration demo (entry point)
+├── pose_test.py              # standalone MediaPipe Pose + body-pose command webcam test (not connected to tracking)
+├── body_pose_recognizer.py   # single-frame ONE_ARM_UP / T_POSE / DOUBLE_BICEPS classification from pose landmarks
+├── pose_command_stabilizer.py # hold-time stabilizer: pose must be held before it becomes an active command
 ├── geometry_utils.py         # shared pure bbox-geometry functions
 └── diagnostics/               # read-only dev diagnostics, kept separate from the core pipeline
     ├── tracking_diagnostics.py   # tracking fragmentation diagnostics
@@ -84,18 +87,24 @@ src/
 
 ### Next Step
 
-**MediaPipe Pose** — setting up full-body pose landmarks as the basis for the planned body-pose commands. Not yet installed, configured, or implemented. Target selection and drone control are not part of this stage.
+**Body-pose commands (standalone)** — `src/pose_test.py` draws the 33 full-body PoseLandmarker landmarks, classifies ONE_ARM_UP / T_POSE / DOUBLE_BICEPS, and shows the resulting command label (TARGET_SELECT / HOVER / LAND) once the pose is held for 0.7 s. These are visual labels only: nothing is connected to detection/tracking, and no drone behavior is triggered. Next is physical webcam testing and threshold tuning. Target selection and drone control are not part of this stage.
 
 ### Structure
 
 - `src/` — source code
-- `tests/` — test code (no automated tests yet)
-- `models/` — local model files, excluded from Git
+- `tests/` — synthetic unit tests (`.venv\Scripts\python.exe -m unittest discover -s tests -v`)
+- `models/` — local model files, excluded from Git (`pose_test.py` needs `models/pose_landmarker_lite.task`, see Setup)
 
 ### Setup
 
 ```bash
 pip install -r requirements.txt
+```
+
+MediaPipe Pose model for `pose_test.py` (not in Git):
+
+```bash
+curl -L -o models/pose_landmarker_lite.task https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task
 ```
 
 ---
@@ -123,8 +132,8 @@ Camera
   → YOLOv8n Person Detection      [구현됨]
   → BoT-SORT Person Tracking      [구현됨]
   → Track Validation              [구현됨]
-  → MediaPipe Pose                [계획 / 미구현]
-  → Body-Pose Recognition         [계획]
+  → MediaPipe Pose                [단독 테스트만 / 미통합]
+  → Body-Pose Recognition         [단독 테스트만 / 미통합]
   → Pose-to-Person Association    [계획]
   → Target Selection              [계획]
   → Person-Following Control      [계획]
@@ -149,8 +158,8 @@ Camera
 | Person Detection (YOLOv8n) | ✅ DONE |
 | Person Tracking (BoT-SORT) | ✅ BASELINE ESTABLISHED |
 | Track Validation (CANDIDATE → CONFIRMED) | ✅ BASELINE ESTABLISHED |
-| MediaPipe Pose | ⬜ 미구현 (NEXT) |
-| Body-Pose Recognition | ⬜ 미구현 |
+| MediaPipe Pose | 🔧 단독 웹캠 테스트 (`pose_test.py`), tracking과 미연결 |
+| Body-Pose Recognition | 🔧 단독 모듈 (`body_pose_recognizer.py` + hold-time stabilizer), `pose_test.py`에서 표시; 시각적 라벨만, 미통합 |
 | Pose-to-Person Association | ⬜ 미구현 |
 | Target Selection | ⬜ 미구현 |
 | Person-Following Control | ⬜ 미구현 |
@@ -170,6 +179,9 @@ src/
 ├── person_tracker.py         # BoT-SORT tracking → persistent track ID
 ├── track_validator.py        # CANDIDATE/CONFIRMED 상태 관리
 ├── yolo_person_detection.py  # person detection + tracking 통합 데모 (실행 진입점)
+├── pose_test.py              # MediaPipe Pose + body-pose 명령 단독 웹캠 테스트 (tracking과 미연결)
+├── body_pose_recognizer.py   # pose landmark 기반 단일 프레임 ONE_ARM_UP / T_POSE / DOUBLE_BICEPS 분류
+├── pose_command_stabilizer.py # hold-time stabilizer: 일정 시간 유지해야 명령이 활성화됨
 ├── geometry_utils.py         # bbox geometry 공용 순수 함수
 └── diagnostics/               # 핵심 파이프라인과 분리된 read-only 개발용 진단 도구
     ├── tracking_diagnostics.py   # 추적 fragmentation 진단
@@ -180,16 +192,22 @@ src/
 
 ### Next Step
 
-**MediaPipe Pose** — 계획된 body-pose 명령의 기반이 될 전신 pose landmark를 준비하는 단계. 아직 설치·설정·구현되지 않았다. Target selection과 드론 제어는 이 단계에 포함되지 않는다.
+**Body-pose 명령 (단독)** — `src/pose_test.py`가 전신 landmark 33개를 그리고 ONE_ARM_UP / T_POSE / DOUBLE_BICEPS를 분류하며, 0.7초 유지되면 명령 라벨(TARGET_SELECT / HOVER / LAND)을 표시한다. 시각적 라벨일 뿐 detection/tracking과 연결되지 않았고 드론 동작도 없다. 다음은 실제 웹캠 테스트와 threshold 튜닝이다. Target selection과 드론 제어는 이 단계에 포함되지 않는다.
 
 ### Structure
 
 - `src/` — 소스 코드
-- `tests/` — 테스트 코드 (아직 자동화 테스트 없음)
-- `models/` — 로컬 모델 파일, Git에서 제외됨
+- `tests/` — synthetic 단위 테스트 (`.venv\Scripts\python.exe -m unittest discover -s tests -v`)
+- `models/` — 로컬 모델 파일, Git에서 제외됨 (`pose_test.py`는 `models/pose_landmarker_lite.task` 필요, Setup 참고)
 
 ### Setup
 
 ```bash
 pip install -r requirements.txt
+```
+
+`pose_test.py`용 MediaPipe Pose 모델 (Git에 포함되지 않음):
+
+```bash
+curl -L -o models/pose_landmarker_lite.task https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task
 ```
