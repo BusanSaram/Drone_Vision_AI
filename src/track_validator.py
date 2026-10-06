@@ -171,6 +171,15 @@ class TrackValidator:
 
         return validated
 
+    def is_tracked(self, track_id: int) -> bool:
+        """True while `track_id` is still known to the validator.
+
+        Covers a visible CANDIDATE/CONFIRMED track and a CONFIRMED track that
+        is temporarily missing but still within `lost_grace_time`. False once
+        the track has expired (or was never seen). Read-only.
+        """
+        return track_id in self._records
+
     def _log(self, event: str, track_id: int, now: float, duration: float) -> None:
         """Per-event debug log (CANDIDATE CREATED, TRACK CONFIRMED, etc.).
 

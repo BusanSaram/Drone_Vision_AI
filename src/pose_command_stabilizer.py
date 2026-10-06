@@ -170,6 +170,10 @@ class TrackPoseStabilizers:
             self._stabilizers[track_id] = stabilizer
         return stabilizer.update(raw_pose, now)
 
+    def reset(self) -> None:
+        """Drop every track's hold/grace history (e.g. at the start of a new session)."""
+        self._stabilizers.clear()
+
     def prune(self, keep_track_ids) -> None:
         keep = set(keep_track_ids)
         for track_id in list(self._stabilizers):

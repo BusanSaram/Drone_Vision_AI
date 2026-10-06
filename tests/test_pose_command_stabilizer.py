@@ -302,6 +302,16 @@ class TrackPoseStabilizersTests(unittest.TestCase):
         s.prune([])
         self.assertEqual(s.track_ids, set())
 
+    def test_reset_clears_all_tracks(self):
+        s = self.stabilizers
+        s.update(1, BodyPose.T_POSE, now=0.0)
+        s.update(2, BodyPose.ONE_ARM_UP, now=0.0)
+        s.reset()
+        self.assertEqual(s.track_ids, set())
+        state = s.update(1, BodyPose.T_POSE, now=0.8)  # would be active without the reset
+        self.assertIs(state.active, BodyPose.NONE)
+        self.assertEqual(state.held_for, 0.0)
+
     def test_returning_track_restarts_hold(self):
         s = self.stabilizers
         s.update(1, BodyPose.T_POSE, now=0.0)

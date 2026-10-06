@@ -8,6 +8,7 @@ Pipeline:
            -> match_tracks_to_detections() (track_id -> this frame's keypoints)
            -> classify_pose() per CONFIRMED track -> raw pose
            -> TrackPoseStabilizers (0.7 s hold + short NONE grace, one per track ID) -> command
+           -> TargetSelector (SEARCHING / FOLLOWING / LAND_REQUESTED, selected track ID)
            -> OpenCV visualization
 
 Tracker and validator settings are identical to the detection-only baseline
@@ -18,13 +19,20 @@ Display: CONFIRMED tracks get bbox, "ID n | CONFIRMED | conf x.xx", their
 skeleton, "Raw Pose: ..." and "Command: ..." (with hold progress while a pose
 is being held, and "[NONE grace]" while a NONE dropout is tolerated);
 CANDIDATE tracks get bbox and label only. A CONFIRMED track with no
-keypoints this frame counts as raw pose NONE. Top-left shows smoothed
-FPS, the number of YOLO Pose detections and the number of CONFIRMED tracks.
+keypoints this frame counts as raw pose NONE. The selected target is drawn
+in magenta with a "TARGET" label. Top-left shows smoothed FPS, the number of
+YOLO Pose detections, the number of CONFIRMED tracks and the selection
+state / target ID. Selection events are printed to the console.
 Per-stage rolling timings are printed to the console every
 PRINT_INTERVAL seconds; run-average timings and FPS are printed on exit.
 
-Commands are display labels only: nothing selects a target, follows anyone,
-or talks to a drone.
+TargetSelector only decides who the target is: nothing follows anyone or
+talks to a drone. A LAND request is a state/console message only.
+
+Keys: q = quit. r = DEV/DEMO ONLY - simulate a new autonomous session
+(selector -> SEARCHING with no target, all pose hold history cleared;
+tracker and validator keep running). Stand-in for the real MANUAL -> AUTO
+flight-mode transition, which will call start_new_session() instead.
 """
 
 import time
@@ -39,6 +47,7 @@ from person_detector import get_device
 from person_tracker import PersonTracker
 from pose_command_stabilizer import TrackPoseStabilizers
 from rolling_stats import FpsMeter, StageTimer
+from target_selector import TargetSelector
 from track_validator import CONFIRMATION_TIME, LOST_GRACE_TIME, TrackState, TrackValidator
 from yolo_person_detection import NEW_TRACK_THRESH, WARMUP_FRAMES
 from yolo_pose_detector import YoloPoseDetector
@@ -46,11 +55,14 @@ from yolo_pose_detector import YoloPoseDetector
 ROLLING_WINDOW = 30  # frames
 PRINT_INTERVAL = 2.0  # seconds between console timing lines
 
-STAGES = ("pose_inference", "tracking", "validation", "association", "pose_commands", "drawing", "total")
+STAGES = (
+    "pose_inference", "tracking", "validation", "association", "pose_commands", "selection", "drawing", "total",
+)
 LABEL_LINE_HEIGHT = 22  # px between stacked per-track label lines
 
 CONFIRMED_COLOR = (255, 255, 0)  # cyan (BGR)
 CANDIDATE_COLOR = (0, 165, 255)  # orange (BGR)
+TARGET_COLOR = (255, 0, 255)  # magenta (BGR)
 KEYPOINT_COLOR = (0, 255, 0)  # green (BGR)
 STATUS_COLOR = (0, 0, 255)  # red (BGR)
 
@@ -78,23 +90,46 @@ def pose_label_lines(state, hold_time) -> list[str]:
     return [f"Raw Pose: {state.raw_pose.value}", f"Command: {command}"]
 
 
-def draw_track(frame, validated, extra_lines=()):
+def draw_track(frame, validated, extra_lines=(), is_target=False):
     """Bbox plus stacked label lines above it: ID/state/conf first, then `extra_lines`."""
     person = validated.tracked_person
     x1, y1, x2, y2 = person.bbox
-    color = CONFIRMED_COLOR if validated.state is TrackState.CONFIRMED else CANDIDATE_COLOR
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-    lines = [f"ID {person.track_id} | {validated.state.value} | conf {person.confidence:.2f}", *extra_lines]
+    if is_target:
+        color = TARGET_COLOR
+    else:
+        color = CONFIRMED_COLOR if validated.state is TrackState.CONFIRMED else CANDIDATE_COLOR
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3 if is_target else 2)
+    header = f"ID {person.track_id} | {validated.state.value} | conf {person.confidence:.2f}"
+    if is_target:
+        header = "TARGET | " + header
+    lines = [header, *extra_lines]
     top = max(y1 - 10 - LABEL_LINE_HEIGHT * (len(lines) - 1), 15)
     for i, line in enumerate(lines):
         cv2.putText(frame, line, (x1, top + LABEL_LINE_HEIGHT * i), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
 
-def draw_status(frame, fps, num_detections, num_confirmed):
+def draw_status(frame, fps, num_detections, num_confirmed, selection):
     fps_text = "FPS: -" if fps is None else f"FPS: {fps:.1f}"
-    lines = [fps_text, f"Pose detections: {num_detections}", f"Confirmed tracks: {num_confirmed}"]
+    target_text = "-" if selection.target_id is None else str(selection.target_id)
+    lines = [
+        fps_text,
+        f"Pose detections: {num_detections}",
+        f"Confirmed tracks: {num_confirmed}",
+        f"State: {selection.state.value} | Target: {target_text}",
+    ]
     for i, line in enumerate(lines):
         cv2.putText(frame, line, (10, 30 + 30 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.8, STATUS_COLOR, 2)
+
+
+def start_new_session(selector, stabilizers):
+    """Begin a fresh autonomous session: SEARCHING, no target, no pose hold history.
+
+    Holds started before the session must not complete into commands in it,
+    so the stabilizers are cleared together with the selector. The tracker
+    and TrackValidator are deliberately left running (track IDs stay valid).
+    """
+    selector.reset()
+    stabilizers.reset()
 
 
 def fit_to_window(frame, window_size):
@@ -127,6 +162,7 @@ def main():
     tracker = PersonTracker(new_track_thresh=NEW_TRACK_THRESH)
     validator = TrackValidator(confirmation_time=CONFIRMATION_TIME, lost_grace_time=LOST_GRACE_TIME)
     stabilizers = TrackPoseStabilizers()
+    selector = TargetSelector()
     timer = StageTimer(window=ROLLING_WINDOW)
     fps_meter = FpsMeter(window=ROLLING_WINDOW)
 
@@ -178,6 +214,7 @@ def main():
             with timer.measure("pose_commands"):
                 pose_now = time.monotonic()
                 pose_states = {}
+                activations = {}  # track_id -> pose whose hold completed this frame
                 for validated in validated_tracks:
                     if validated.state is not TrackState.CONFIRMED:
                         continue
@@ -187,22 +224,35 @@ def main():
                     state = stabilizers.update(track_id, raw_pose, pose_now)
                     pose_states[track_id] = state
                     if state.newly_activated:
+                        activations[track_id] = state.active
                         print(f"Track {track_id} command: {POSE_TO_COMMAND[state.active].value} "
-                              f"({state.active.value}) - display only", flush=True)
+                              f"({state.active.value})", flush=True)
                 stabilizers.prune(pose_states)
+
+            # Target selection: only the selected track's commands count while FOLLOWING;
+            # the target is lost only once the validator expires its track.
+            with timer.measure("selection"):
+                target_id = selector.target_id
+                target_alive = target_id is not None and validator.is_tracked(target_id)
+                selection = selector.update(activations, target_alive)
+                if selection.event is not None:
+                    ids = ", ".join(str(i) for i in selection.event_track_ids)
+                    print(f"Selection: {selection.event.value} (track {ids}) -> {selection.state.value}",
+                          flush=True)
 
             with timer.measure("drawing"):
                 for validated in validated_tracks:
                     track_id = validated.tracked_person.track_id
+                    is_target = track_id == selection.target_id
                     state = pose_states.get(track_id)
                     if state is None:  # CANDIDATE
-                        draw_track(frame, validated)
+                        draw_track(frame, validated, is_target=is_target)
                         continue
-                    draw_track(frame, validated, pose_label_lines(state, stabilizers.hold_time))
+                    draw_track(frame, validated, pose_label_lines(state, stabilizers.hold_time), is_target)
                     index = track_to_detection.get(track_id)
                     if index is not None:
-                        draw_skeleton(frame, detections.keypoints[index], CONFIRMED_COLOR)
-                draw_status(frame, fps, len(detections), len(pose_states))
+                        draw_skeleton(frame, detections.keypoints[index], TARGET_COLOR if is_target else CONFIRMED_COLOR)
+                draw_status(frame, fps, len(detections), len(pose_states), selection)
 
         if now - last_print >= PRINT_INTERVAL:
             fps_text = "-" if fps is None else f"{fps:.1f}"
@@ -211,8 +261,14 @@ def main():
 
         _x, _y, win_w, win_h = cv2.getWindowImageRect(WINDOW_NAME)
         cv2.imshow(WINDOW_NAME, fit_to_window(frame, (win_w, win_h)))
-        if cv2.waitKey(1) & 0xFF == ord("q"):
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
             break
+        if key == ord("r"):
+            # DEV/DEMO ONLY: replace with the real MANUAL -> AUTO mode transition (RC/MAVLink).
+            start_new_session(selector, stabilizers)
+            print("[DEV] Simulated new autonomous session (r key): SEARCHING, target cleared, "
+                  "pose hold history reset; tracker/validator unchanged", flush=True)
 
     end_time = time.perf_counter()
     cap.release()
