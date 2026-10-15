@@ -20,6 +20,11 @@ Per NEW AI result (deduplicated by `result_timestamp`):
                           box not touching the image edge; keypoints span the box;
                           upright (vertical order, torso tilt, leg/thigh vs torso length);
                           roughly facing the camera (shoulder width vs torso length).
+    3b. Occlusion       - another detection's box covering the target box, or the lower-body
+                          keypoint confidence dropping vs the last accepted result -> HOLD with
+                          the label OCCLUSION_SUSPECTED. Unseen body parts (inside the frame) and
+                          a size jump with one box edge fixed get the same label. It is a
+                          suspicion, never reported as a confirmed occlusion.
     4. Box-height check - confidence, h_norm = box height / frame height within
                           [min_box_height, max_box_height], change vs the last ACCEPTED
                           height limited by real elapsed time. A rejected size never
@@ -83,6 +88,12 @@ class FollowParams:
     change_noise_allowance: float = 0.08  # extra relative change allowed per comparison (box jitter)
     max_change_after_gap: float = 0.3  # cap on allowed relative change however long the gap
 
+    # --- occlusion indicators (HOLD + OCCLUSION_SUSPECTED; never reported as a confirmed occlusion) ---
+    max_other_overlap_ratio: float = 0.15  # part of the target box covered by another detection's box
+    max_lower_body_conf_drop: float = 0.35  # drop of mean knee/ankle confidence vs the last accepted result
+    edge_shift_stable: float = 0.05  # |edge shift| / reference box height counted as "edge did not move"
+    edge_shift_moved: float = 0.10  # edge shift / reference box height counted as "edge moved"
+
     # --- revalidation ---
     resume_valid_count: int = 4  # consecutive valid NEW results (~0.5 s at 8/s) before motion
 
@@ -130,6 +141,7 @@ class FollowInput:
     keypoints: np.ndarray | None  # (17, 3) x, y, confidence
     frame_width: int
     frame_height: int
+    other_boxes: tuple = ()  # x1, y1, x2, y2 of the OTHER detections in the same result (occlusion check)
 
 
 @dataclass(frozen=True)
@@ -143,6 +155,10 @@ class FollowCommand:
     target_id: int | None
     box_height: float | None = None  # h_norm of the measurement, for logging
     center_error: float | None = None  # [-1, 1], + = target right of center
+    stage: str = ""  # gate that decided: selection / data / full_body / occlusion / measurement /
+    #                  revalidation / control / timeout
+    diagnostics: tuple = ()  # labels such as "OCCLUSION_SUSPECTED" (a suspicion, never a confirmation)
+    indicators: tuple = ()  # evidence behind the labels / the decision, for the log
 
     def __post_init__(self):
         if not (self.forward_mps >= 0.0) or not math.isfinite(self.forward_mps):
@@ -157,56 +173,99 @@ def _stop(state: FollowState, reason: str, target_id, land: bool = False, **extr
 
 # ---------- validation (pure functions) ----------
 
+# Full-body failures that come from body parts not being seen (as opposed to posture or framing).
+VISIBILITY_FAILURES = ("head not visible", "shoulders not visible", "hips not visible", "legs not visible",
+                       "keypoints do not span the box")
+
+
+def body_metrics(keypoints, bbox, frame_width: int, frame_height: int,
+                 params: FollowParams = FollowParams()) -> dict:
+    """Every full-body check, its measured value and the list of failed checks (in check order).
+
+    `reason` is the first failed check ("ok" if none) - exactly what validate_full_body() returns.
+    Ratios are None when the keypoints they need are not reliable.
+    """
+    if keypoints is None or bbox is None:
+        return {"reason": "no keypoints", "failures": ["no keypoints"]}
+    kp = np.asarray(keypoints, dtype=np.float64)
+    if kp.shape != (NUM_KEYPOINTS, 3):
+        return {"reason": f"keypoints shape {kp.shape}", "failures": [f"keypoints shape {kp.shape}"]}
+    ok = np.isfinite(kp).all(axis=1) & (kp[:, 2] >= params.keypoint_min_conf)
+    conf = np.nan_to_num(kp[:, 2])
+
+    x1, y1, x2, y2 = (float(v) for v in bbox)
+    edge = params.edge_margin_px
+    head = [i for i in HEAD if ok[i]]
+    knees = [i for i in KNEES if ok[i]]
+    ankles = [i for i in ANKLES if ok[i]]
+    m = {
+        "clipped": x1 <= edge or y1 <= edge or x2 >= frame_width - 1 - edge or y2 >= frame_height - 1 - edge,
+        "head": len(head), "shoulders": int(sum(ok[i] for i in SHOULDERS)), "hips": int(sum(ok[i] for i in HIPS)),
+        "knees": len(knees), "ankles": len(ankles),
+        "upper_conf": float(conf[list(SHOULDERS + HIPS)].mean()),
+        "lower_conf": float(conf[list(KNEES + ANKLES)].mean()),
+        "span": None, "upright_order": None, "tilt_deg": None, "leg_ratio": None, "thigh_ratio": None,
+        "shoulder_ratio": None,
+    }
+    failures = []
+    if m["clipped"]:
+        failures.append("box clipped by image edge")
+    if m["head"] < params.min_head_keypoints:
+        failures.append("head not visible")
+    if m["shoulders"] < 2:
+        failures.append("shoulders not visible")
+    if m["hips"] < 2:
+        failures.append("hips not visible")
+    if not knees or not ankles:
+        failures.append("legs not visible")
+
+    if head and m["shoulders"] == 2 and m["hips"] == 2 and knees and ankles:
+        head_y = min(kp[i, 1] for i in head)
+        shoulder = kp[list(SHOULDERS), :2].mean(axis=0)
+        hip = kp[list(HIPS), :2].mean(axis=0)
+        knee_y = float(np.mean([kp[i, 1] for i in knees]))
+        ankle_y = float(np.mean([kp[i, 1] for i in ankles]))
+        lowest_ankle = max(kp[i, 1] for i in ankles)
+        m["span"] = (lowest_ankle - head_y) / (y2 - y1) if y2 > y1 else 0.0
+        m["upright_order"] = bool(head_y < shoulder[1] < hip[1] < knee_y < ankle_y)
+        if m["span"] < params.min_keypoint_span_ratio:
+            failures.append("keypoints do not span the box")
+        if not m["upright_order"]:
+            failures.append("not upright (vertical order)")
+        torso = hip[1] - shoulder[1]
+        if torso > 0:
+            m["tilt_deg"] = math.degrees(math.atan2(abs(shoulder[0] - hip[0]), torso))
+            m["leg_ratio"] = (ankle_y - hip[1]) / torso
+            m["thigh_ratio"] = (knee_y - hip[1]) / torso
+            m["shoulder_ratio"] = abs(kp[LEFT_SHOULDER, 0] - kp[RIGHT_SHOULDER, 0]) / torso
+            if m["tilt_deg"] > params.max_torso_tilt_deg:
+                failures.append("torso tilted")
+            if m["leg_ratio"] < params.min_leg_to_torso_ratio:
+                failures.append("legs folded (crouch / sit)")
+            if m["thigh_ratio"] < params.min_thigh_to_torso_ratio:
+                failures.append("thighs not vertical (sitting)")
+            if m["shoulder_ratio"] < params.min_shoulder_to_torso_ratio:
+                failures.append("sideways to camera")
+    m["failures"] = failures
+    m["reason"] = failures[0] if failures else "ok"
+    return m
+
+
 def validate_full_body(keypoints, bbox, frame_width: int, frame_height: int,
                        params: FollowParams = FollowParams()) -> tuple[bool, str]:
     """Is the person visible enough, upright and facing the camera for box height to mean distance?"""
-    if keypoints is None or bbox is None:
-        return False, "no keypoints"
-    kp = np.asarray(keypoints, dtype=np.float64)
-    if kp.shape != (NUM_KEYPOINTS, 3):
-        return False, f"keypoints shape {kp.shape}"
-    ok = np.isfinite(kp).all(axis=1) & (kp[:, 2] >= params.keypoint_min_conf)
+    reason = body_metrics(keypoints, bbox, frame_width, frame_height, params)["reason"]
+    return reason == "ok", reason
 
-    x1, y1, x2, y2 = (float(v) for v in bbox)
-    m = params.edge_margin_px
-    if x1 <= m or y1 <= m or x2 >= frame_width - 1 - m or y2 >= frame_height - 1 - m:
-        return False, "box clipped by image edge"
 
-    head = [i for i in HEAD if ok[i]]
-    if len(head) < params.min_head_keypoints:
-        return False, "head not visible"
-    if not all(ok[i] for i in SHOULDERS):
-        return False, "shoulders not visible"
-    if not all(ok[i] for i in HIPS):
-        return False, "hips not visible"
-    knees = [i for i in KNEES if ok[i]]
-    ankles = [i for i in ANKLES if ok[i]]
-    if not knees or not ankles:
-        return False, "legs not visible"
-
-    head_y = min(kp[i, 1] for i in head)
-    shoulder = kp[list(SHOULDERS), :2].mean(axis=0)
-    hip = kp[list(HIPS), :2].mean(axis=0)
-    knee_y = float(np.mean([kp[i, 1] for i in knees]))
-    ankle_y = float(np.mean([kp[i, 1] for i in ankles]))
-    lowest_ankle = max(kp[i, 1] for i in ankles)
-
-    if (lowest_ankle - head_y) < params.min_keypoint_span_ratio * (y2 - y1):
-        return False, "keypoints do not span the box"
-    if not (head_y < shoulder[1] < hip[1] < knee_y < ankle_y):
-        return False, "not upright (vertical order)"
-    torso = hip[1] - shoulder[1]
-    tilt = math.degrees(math.atan2(abs(shoulder[0] - hip[0]), torso))
-    if tilt > params.max_torso_tilt_deg:
-        return False, "torso tilted"
-    if (ankle_y - hip[1]) < params.min_leg_to_torso_ratio * torso:
-        return False, "legs folded (crouch / sit)"
-    if (knee_y - hip[1]) < params.min_thigh_to_torso_ratio * torso:
-        return False, "thighs not vertical (sitting)"
-    shoulder_width = abs(kp[LEFT_SHOULDER, 0] - kp[RIGHT_SHOULDER, 0])
-    if shoulder_width < params.min_shoulder_to_torso_ratio * torso:
-        return False, "sideways to camera"
-    return True, "ok"
+def overlap_ratio(target, other) -> float:
+    """Part of the target box's area covered by `other` (0..1)."""
+    tx1, ty1, tx2, ty2 = target
+    ox1, oy1, ox2, oy2 = other
+    w = min(tx2, ox2) - max(tx1, ox1)
+    h = min(ty2, oy2) - max(ty1, oy1)
+    area = (tx2 - tx1) * (ty2 - ty1)
+    return max(0.0, w) * max(0.0, h) / area if area > 0 else 0.0
 
 
 def allowed_relative_change(dt: float, params: FollowParams, after_rejected_jump: bool) -> float:
@@ -230,11 +289,22 @@ class FollowController:
     def last_command(self) -> FollowCommand:
         return self._last_command
 
+    @property
+    def valid_streak(self) -> int:
+        return self._valid_streak
+
+    @property
+    def baseline_height(self) -> float | None:
+        return self._baseline_h
+
+    @property
+    def last_body_metrics(self) -> dict | None:
+        """body_metrics() of the last NEW result that reached the full-body check (for logging)."""
+        return self._last_body
+
     def rebaseline(self) -> None:
         """Operator action: drop the accepted box-height baseline so the next valid streak defines it."""
-        self._baseline_h = None
-        self._baseline_t = None
-        self._jump_rejected = False
+        self._clear_baseline()
         self._invalidate()
 
     def update(self, inp: FollowInput) -> FollowCommand:
@@ -247,22 +317,29 @@ class FollowController:
         """What a command publisher should send at time `now` (communication / freshness watchdog)."""
         if self._last_update_time is None or now - self._last_update_time > self.params.command_timeout_s:
             self._invalidate()
-            return _stop(FollowState.HOLD_TIMEOUT, "no controller update within command timeout", self._target_id)
+            return _stop(FollowState.HOLD_TIMEOUT, "no controller update within command timeout", self._target_id,
+                         stage="timeout")
         cmd = self._last_command
         moving = cmd.forward_mps > 0 or cmd.yaw_rate_dps != 0
         if moving and (self._last_result_t is None or now - self._last_result_t > self.params.max_result_age_s):
             self._invalidate()
-            return _stop(FollowState.HOLD_INVALID, "AI result stale", self._target_id)
+            return _stop(FollowState.HOLD_INVALID, "AI result stale", self._target_id, stage="timeout")
         return cmd
 
     # --- internals ---
 
-    def _reset_target(self, target_id) -> None:
-        self._target_id = target_id
+    def _clear_baseline(self) -> None:
         self._baseline_h = None
         self._baseline_t = None
+        self._baseline_bbox = None
+        self._baseline_lower_conf = None
         self._jump_rejected = False
+
+    def _reset_target(self, target_id) -> None:
+        self._target_id = target_id
+        self._clear_baseline()
         self._last_result_t = None
+        self._last_body = None
         self._invalidate()
 
     def _invalidate(self) -> None:
@@ -280,53 +357,97 @@ class FollowController:
         p = self.params
         if inp.selection_state is SelectionState.LAND_REQUESTED:
             self._invalidate()
-            return _stop(FollowState.LAND_REQUESTED, "landing requested by target", inp.target_id, land=True)
+            return _stop(FollowState.LAND_REQUESTED, "landing requested by target", inp.target_id, land=True,
+                         stage="selection")
         if inp.selection_state is not SelectionState.FOLLOWING or inp.target_id is None:
             self._reset_target(None)
-            return _stop(FollowState.INACTIVE, "no target selected", None)
+            return _stop(FollowState.INACTIVE, "no target selected", None, stage="selection")
         if inp.target_id != self._target_id:
             self._reset_target(inp.target_id)  # new selection: nothing carried over
 
         if not inp.target_observed:
-            return self._hold(FollowState.HOLD_TARGET_LOST, "target not in latest result")
+            return self._hold(FollowState.HOLD_TARGET_LOST, "target not in latest result", stage="data")
         if inp.result_timestamp is None or inp.now - inp.result_timestamp > p.max_result_age_s:
-            return self._hold(FollowState.HOLD_INVALID, "AI result stale")
+            return self._hold(FollowState.HOLD_INVALID, "AI result stale", stage="data")
         if not inp.usable:
-            return self._hold(FollowState.HOLD_INVALID, "target status not usable")
+            return self._hold(FollowState.HOLD_INVALID, "target status not usable", stage="data")
         if inp.measurement_track_id != inp.target_id or inp.bbox is None:
-            return self._hold(FollowState.HOLD_INVALID, "no measurement for the selected track")
+            return self._hold(FollowState.HOLD_INVALID, "no measurement for the selected track", stage="data")
 
         if self._last_result_t is not None and inp.result_timestamp <= self._last_result_t:
             return self._last_command  # same AI result again (e.g. REUSED frame): no new measurement
         self._last_result_t = inp.result_timestamp
 
-        x1, y1, x2, y2 = (float(v) for v in inp.bbox)
+        bbox = tuple(float(v) for v in inp.bbox)
+        x1, y1, x2, y2 = bbox
         h = (y2 - y1) / inp.frame_height
         err = ((x1 + x2) / 2 / inp.frame_width - 0.5) * 2
         meas = {"box_height": h, "center_error": err}
 
-        body_ok, why = validate_full_body(inp.keypoints, inp.bbox, inp.frame_width, inp.frame_height, p)
-        if not body_ok:
-            return self._hold(FollowState.HOLD_INVALID, f"full body: {why}", **meas)
+        # 1. full body (unchanged checks; adds an OCCLUSION_SUSPECTED label when body parts are unseen
+        #    while the box is inside the frame - a suspicion only, the parts may simply be out of view)
+        body = self._last_body = body_metrics(inp.keypoints, bbox, inp.frame_width, inp.frame_height, p)
+        if body["reason"] != "ok":
+            unseen = [f for f in body["failures"] if f in VISIBILITY_FAILURES]
+            suspected = bool(unseen) and not body.get("clipped", False)
+            return self._hold(FollowState.HOLD_INVALID, f"full body: {body['reason']}", stage="full_body",
+                              diagnostics=("OCCLUSION_SUSPECTED",) if suspected else (),
+                              indicators=tuple(body["failures"]), **meas)
+
+        # 2. occlusion indicators on an otherwise valid body
+        overlaps = [overlap_ratio(bbox, tuple(float(v) for v in o)) for o in inp.other_boxes]
+        worst = max(overlaps, default=0.0)
+        if worst >= p.max_other_overlap_ratio:
+            return self._hold(FollowState.HOLD_INVALID, "another detection overlaps the target box",
+                              stage="occlusion", diagnostics=("OCCLUSION_SUSPECTED",),
+                              indicators=(f"other_overlap={worst:.2f}",), **meas)
+        if self._baseline_lower_conf is not None and \
+                self._baseline_lower_conf - body["lower_conf"] >= p.max_lower_body_conf_drop:
+            return self._hold(FollowState.HOLD_INVALID, "lower-body keypoint confidence dropped",
+                              stage="occlusion", diagnostics=("OCCLUSION_SUSPECTED",),
+                              indicators=(f"lower_conf {self._baseline_lower_conf:.2f}->{body['lower_conf']:.2f}",),
+                              **meas)
+
+        # 3. box-height measurement
         if inp.confidence is None or inp.confidence < p.min_confidence:
-            return self._hold(FollowState.HOLD_INVALID, "detection confidence low", **meas)
+            return self._hold(FollowState.HOLD_INVALID, "detection confidence low", stage="measurement", **meas)
         if not p.min_box_height <= h <= p.max_box_height:
-            return self._hold(FollowState.HOLD_INVALID, "box height outside usable range", **meas)
+            return self._hold(FollowState.HOLD_INVALID, "box height outside usable range", stage="measurement", **meas)
         if self._baseline_h is not None:
             dt = inp.result_timestamp - self._baseline_t
             change = abs(h / self._baseline_h - 1)
             if dt <= 0 or change > allowed_relative_change(dt, p, self._jump_rejected):
                 self._jump_rejected = True  # rejected size is NOT adopted as the baseline
+                edges = self._edge_indicators(bbox)
+                one_edge = any(e in ("bottom edge rose, top stable", "top edge dropped, bottom stable") for e in edges)
                 return self._hold(FollowState.HOLD_INVALID,
-                                  f"box height change {change:.0%} not explained (ref {self._baseline_h:.2f})", **meas)
+                                  f"box height change {change:.0%} not explained (ref {self._baseline_h:.2f})",
+                                  stage="measurement", diagnostics=("OCCLUSION_SUSPECTED",) if one_edge else (),
+                                  indicators=edges, **meas)
 
         self._baseline_h, self._baseline_t, self._jump_rejected = h, inp.result_timestamp, False
+        self._baseline_bbox, self._baseline_lower_conf = bbox, body["lower_conf"]
         self._valid_streak += 1
         if self._valid_streak < p.resume_valid_count:
             self._forward = self._yaw = 0.0
             return _stop(FollowState.HOLD_INVALID, f"revalidating {self._valid_streak}/{p.resume_valid_count}",
-                         self._target_id, **meas)
+                         self._target_id, stage="revalidation", **meas)
         return self._control(inp.now, h, err, meas)
+
+    def _edge_indicators(self, bbox) -> tuple:
+        """Which box edges moved vs the last accepted box (a shrink with one edge fixed hints at occlusion)."""
+        if self._baseline_bbox is None:
+            return ()
+        p = self.params
+        ref_h = self._baseline_bbox[3] - self._baseline_bbox[1]
+        top = (bbox[1] - self._baseline_bbox[1]) / ref_h
+        bottom = (bbox[3] - self._baseline_bbox[3]) / ref_h
+        out = [f"top_shift={top:+.2f}", f"bottom_shift={bottom:+.2f}"]
+        if abs(top) <= p.edge_shift_stable and bottom <= -p.edge_shift_moved:
+            out.append("bottom edge rose, top stable")
+        elif abs(bottom) <= p.edge_shift_stable and top >= p.edge_shift_moved:
+            out.append("top edge dropped, bottom stable")
+        return tuple(out)
 
     def _control(self, now: float, h: float, err: float, meas) -> FollowCommand:
         p = self.params
@@ -351,4 +472,4 @@ class FollowController:
             state, reason = FollowState.HOLD_DISTANCE, "in distance band" if h >= p.target_box_height_low \
                 else "below band, inside hysteresis"
         return FollowCommand(state, reason, self._forward, self._yaw, self._forward == 0.0, False,
-                             self._target_id, **meas)
+                             self._target_id, stage="control", **meas)

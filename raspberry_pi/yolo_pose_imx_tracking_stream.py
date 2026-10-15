@@ -19,6 +19,12 @@ budget, detection score histogram, primary track states, comparison-tracker
 stats, CPU / RSS / MemAvailable / temperature. The summary checks that the
 primary tracker was updated exactly once per NEW result.
 
+--follow-shadow (off by default) additionally runs the forward-only follow
+controller in SHADOW MODE (follow_shadow.py): its hypothetical decisions are
+written to a JSONL log and, with --shadow-overlay, one line at the bottom of the
+stream. It never sends any command. Without the flag the shadow code is not
+even imported.
+
 The existing yolo_pose_imx_stream.py (detection-only view) is left unchanged.
 
 Run on the Pi (inside the yolo_pose_imx folder), after starting the Windows receiver:
@@ -85,6 +91,14 @@ def get_args():
                         help="Log-only comparison trackers' new_track_thresh values (no GMC)")
     parser.add_argument("--compare-track-buffers", type=int, nargs="*", default=[],
                         help="Also run comparison trackers with these track_buffer values (for every threshold)")
+    # Shadow Mode (off by default): log what the follow controller WOULD command - never sends anything.
+    parser.add_argument("--follow-shadow", action="store_true",
+                        help="Run the follow controller in shadow mode (JSONL log only, no commands)")
+    parser.add_argument("--shadow-log", default=None,
+                        help="Shadow JSONL path (default: shadow_logs/follow_shadow_<time>.jsonl next to this script)")
+    parser.add_argument("--shadow-log-max-mb", type=float, default=50.0, help="Stop logging past this size")
+    parser.add_argument("--shadow-overlay", action="store_true",
+                        help="With --follow-shadow: draw one shadow-status line at the bottom of the stream")
     return parser.parse_args()
 
 
@@ -119,6 +133,16 @@ def main():
         role = "primary" if variant is pipeline.primary else "compare"
         print(f"[TRACK] {role}: {variant.label} (buffer ~{buffer_seconds(variant.track_buffer, 8.0):.2f}s at 8 results/s)",
               flush=True)
+
+    shadow = None
+    if args.follow_shadow:  # imported only when enabled: the default run loads none of the shadow code
+        from follow_shadow import create_shadow, default_log_path, file_sha256
+        log_path = args.shadow_log or default_log_path(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                                     "shadow_logs"))
+        shadow = create_shadow(log_path, args.shadow_log_max_mb, IMAGE_SIZE, metadata={
+            "model": args.model, "model_sha256": file_sha256(args.model), "frame_rate": args.frame_rate,
+            "new_track_thresh": args.new_track_thresh, "track_buffer": args.track_buffer})
+        print(f"[SHADOW] follow controller in SHADOW MODE (no commands sent) -> {log_path}", flush=True)
 
     model = YoloPoseImx(args.model)
     device = AiCamera(headless=False, frame_rate=args.frame_rate, image_size=IMAGE_SIZE)
@@ -168,11 +192,15 @@ def main():
                     score_hist += np.histogram(detections.conf, bins=SCORE_BINS)[0]
                     score_values.update(round(float(c), 3) for c in detections.conf)
                     event = result.selection
+                    if shadow is not None:
+                        shadow.on_new_result(pipeline, now)  # read-only; once per NEW result
                 else:
                     event = pipeline.check_stall(now)  # REUSED frame: no tracking update
                     if event is not None:
                         counts["stalls"] += 1
                         print(f"[TRACK] no NEW result for {pipeline.no_result_timeout:.1f}s - all tracks expired", flush=True)
+                    if shadow is not None:
+                        shadow.on_tick(now)  # what a command publisher would send now (no measurement)
                 if event is not None and event.event is not None:
                     ids = ", ".join(str(i) for i in event.event_track_ids)
                     print(f"[TRACK] Selection: {event.event.value} (track {ids}) -> {event.state.value}", flush=True)
@@ -184,6 +212,8 @@ def main():
                 elapsed = None if start is None else now - start
                 draw_tracking_status(image, status_lines(frame.fps, frame.dps, pipeline.last_result, target, elapsed),
                                      warning_text(result_age, target))
+                if shadow is not None and args.shadow_overlay:
+                    shadow.draw(image)
                 sender.send(image)
 
                 loop_ms = (time.monotonic() - now) * 1000
@@ -218,6 +248,10 @@ def main():
                     interval = new_interval()
     except KeyboardInterrupt as e:
         print(f"[TRACK] stopping ({e or 'Ctrl+C'})", flush=True)
+    finally:
+        if shadow is not None:
+            for line in shadow.close():  # flushes the JSONL writer
+                print(line, flush=True)
 
     print("[TRACK] --- Summary ---")
     print(f"[TRACK] frames: new={counts['new']} reused={counts['reused']} stale(>0.5s)={counts['stale']}, "

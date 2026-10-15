@@ -351,6 +351,138 @@ class YawAndLimitsTest(unittest.TestCase):
         self.assertEqual(cmd.reason, "detection confidence low")
 
 
+ALLOWED_DIAGNOSTICS = {"OCCLUSION_SUSPECTED"}
+
+
+class OcclusionTest(unittest.TestCase):
+    """Occlusion is only ever SUSPECTED (never reported as confirmed); every suspicion holds."""
+
+    def assert_held(self, cmd, stage=None):
+        self.assertEqual((cmd.forward_mps, cmd.yaw_rate_dps), (0.0, 0.0))
+        self.assertTrue(cmd.hold)
+        self.assertEqual(cmd.target_id, 3)  # selection kept
+        if stage:
+            self.assertEqual(cmd.stage, stage)
+
+    def test_other_person_overlapping_target_holds(self):
+        sim = Sim()
+        self.assertGreater(sim.run(12, h=0.35).forward_mps, 0)
+        bbox, kp = person(0.35)
+        other = (bbox[0] + 0.5 * (bbox[2] - bbox[0]), bbox[1], bbox[2] + 60, bbox[3])  # covers right half
+        inp = FollowInput(sim.t + 0.02, sim.t, SelectionState.FOLLOWING, 3, True, True, 3, bbox, 0.816, kp, W, H,
+                          other_boxes=(other,))
+        cmd = sim.ctl.update(inp)
+        self.assertEqual(cmd.diagnostics, ("OCCLUSION_SUSPECTED",))
+        self.assert_held(cmd, "occlusion")
+        self.assertTrue(cmd.indicators[0].startswith("other_overlap="))
+
+    def test_far_away_other_person_does_not_hold(self):
+        sim = Sim()
+        sim.run(12, h=0.35, cx=0.3)
+        bbox, kp = person(0.35, cx=0.3)
+        other, _ = person(0.35, cx=0.8)
+        inp = FollowInput(sim.t + 0.02, sim.t, SelectionState.FOLLOWING, 3, True, True, 3, bbox, 0.816, kp, W, H,
+                          other_boxes=(other,))
+        self.assertIs(sim.ctl.update(inp).state, FollowState.ACTIVE)
+
+    def test_lower_body_confidence_drop_holds(self):
+        sim = Sim()
+        sim.run(12, h=0.35)
+        bbox, kp = person(0.35)
+        kp[[LEFT_KNEE, RIGHT_KNEE, LEFT_ANKLE, RIGHT_ANKLE], 2] = 0.52  # still above 0.5, but 0.9 -> 0.52
+        self.assertTrue(validate_full_body(kp, bbox, W, H)[0])  # the full-body check alone would pass
+        cmd = sim.step(keypoints=kp)
+        self.assertEqual(cmd.diagnostics, ("OCCLUSION_SUSPECTED",))
+        self.assert_held(cmd, "occlusion")
+
+    def test_hidden_legs_inside_frame_are_suspected(self):
+        sim = Sim()
+        sim.run(12, h=0.35)
+        bbox, kp = person(0.35)
+        kp[[LEFT_KNEE, RIGHT_KNEE, LEFT_ANKLE, RIGHT_ANKLE], 2] = 0.05
+        cmd = sim.step(keypoints=kp)
+        self.assertEqual(cmd.diagnostics, ("OCCLUSION_SUSPECTED",))
+        self.assertIn("legs not visible", cmd.indicators)
+        self.assert_held(cmd, "full_body")
+
+    def test_leaving_the_frame_is_not_labelled_occlusion(self):
+        sim = Sim()
+        bbox, kp = person(0.6, top=230)  # feet below the image: box clipped at the bottom
+        bbox = (bbox[0], bbox[1], bbox[2], H - 1)
+        kp[[LEFT_ANKLE, RIGHT_ANKLE], 2] = 0.05
+        cmd = sim.step(bbox=bbox, keypoints=kp)
+        self.assertEqual(cmd.diagnostics, ())
+        self.assertIn("box clipped by image edge", cmd.indicators)
+        self.assertEqual(cmd.forward_mps, 0.0)
+
+    def test_shrink_with_fixed_top_edge_is_suspected(self):
+        sim = Sim()
+        sim.run(12, h=0.40)
+        ref, _ = person(0.40)
+        bbox, kp = person(0.28, top=ref[1])  # same top, bottom moved up by 30 % of the box
+        cmd = sim.step(bbox=bbox, keypoints=kp)
+        self.assertIn("not explained", cmd.reason)
+        self.assertEqual(cmd.diagnostics, ("OCCLUSION_SUSPECTED",))
+        self.assertIn("bottom edge rose, top stable", cmd.indicators)
+        self.assert_held(cmd, "measurement")
+
+    def test_uniform_shrink_is_not_labelled_occlusion(self):
+        sim = Sim()
+        sim.run(12, h=0.40)
+        cmd = sim.step(h=0.28)  # centered: both edges move -> size change, no occlusion label
+        self.assertIn("not explained", cmd.reason)
+        self.assertEqual(cmd.diagnostics, ())
+        self.assertEqual(cmd.forward_mps, 0.0)
+
+    def test_labels_are_only_suspicions(self):
+        rng = random.Random(1)
+        sim = Sim()
+        for _ in range(1500):
+            bbox, kp = person(rng.uniform(0.2, 0.9), rng.uniform(0.2, 0.8),
+                              rng.choice(["standing"] * 5 + ["crouch", "sideways"]))
+            kp[:, 2] = np.clip(kp[:, 2] - rng.choice([0, 0, 0, 0.3, 0.6]) * (np.arange(17) > 10), 0, 1)
+            others = () if rng.random() < 0.7 else (person(0.4, rng.uniform(0.2, 0.8))[0],)
+            inp = FollowInput(sim.t + 0.02, sim.t, SelectionState.FOLLOWING, 3, True, True, 3, bbox, 0.816, kp, W, H,
+                              other_boxes=others)
+            sim.t += DT
+            cmd = sim.ctl.update(inp)
+            self.assertTrue(set(cmd.diagnostics) <= ALLOWED_DIAGNOSTICS)
+            if cmd.diagnostics:
+                self.assertEqual((cmd.forward_mps, cmd.yaw_rate_dps), (0.0, 0.0))
+            self.assertGreaterEqual(cmd.forward_mps, 0.0)
+
+
+class BodyMetricsTest(unittest.TestCase):
+    def test_reason_matches_validator_and_values(self):
+        from follow_controller import body_metrics
+        for pose in ("standing", "crouch", "sitting", "sideways"):
+            bbox, kp = person(0.4, pose=pose)
+            m = body_metrics(kp, bbox, W, H)
+            self.assertEqual((m["reason"] == "ok", m["reason"]), validate_full_body(kp, bbox, W, H))
+        bbox, kp = person(0.4)
+        m = body_metrics(kp, bbox, W, H)
+        self.assertAlmostEqual(m["leg_ratio"], (0.96 - 0.50) / 0.30, places=6)
+        self.assertAlmostEqual(m["thigh_ratio"], (0.74 - 0.50) / 0.30, places=6)
+        self.assertEqual((m["head"], m["shoulders"], m["hips"], m["knees"], m["ankles"]), (5, 2, 2, 2, 2))
+        self.assertEqual(m["failures"], [])
+
+    def test_all_failures_listed(self):
+        from follow_controller import body_metrics
+        bbox, kp = person(0.4)
+        kp[[LEFT_HIP, RIGHT_HIP, LEFT_ANKLE, RIGHT_ANKLE], 2] = 0.1
+        m = body_metrics(kp, bbox, W, H)
+        self.assertEqual(m["failures"], ["hips not visible", "legs not visible"])
+        self.assertIsNone(m["leg_ratio"])
+
+    def test_stage_is_reported(self):
+        sim = Sim()
+        stages = [sim.step(h=0.35).stage for _ in range(5)]
+        self.assertEqual(stages, ["revalidation"] * 3 + ["control"] * 2)
+        self.assertEqual(sim.step(observed=False).stage, "data")
+        self.assertEqual(sim.step(state=SelectionState.SEARCHING).stage, "selection")
+        self.assertEqual(sim.ctl.command_at(sim.t + 1).stage, "timeout")
+
+
 class AdapterTest(unittest.TestCase):
     def fake_pipeline(self, target_id=3, tracked_ids=(3,), assoc=True, usable=True):
         bbox, kp = person(0.4)
@@ -373,6 +505,20 @@ class AdapterTest(unittest.TestCase):
         inp = follow_input_from_pipeline(pipeline, 10.05, W, H)
         self.assertIsNone(inp.bbox)
         self.assertIs(FollowController().update(inp).state, FollowState.HOLD_INVALID)
+
+    def test_other_detections_are_passed_for_occlusion_check(self):
+        bbox, kp = person(0.4)
+        other, okp = person(0.4, cx=0.8)
+        detections = SimpleNamespace(xyxy=np.array([other, bbox]), conf=np.array([0.73, 0.816]),
+                                     keypoints=np.stack([okp, kp]))
+        result = SimpleNamespace(timestamp=10.0, tracked_people=[SimpleNamespace(track_id=3)],
+                                 track_to_detection={3: 1}, detections=detections)
+        status = SimpleNamespace(state=SelectionState.FOLLOWING, target_id=3, usable=True)
+        inp = follow_input_from_pipeline(SimpleNamespace(target_status=lambda now: status, last_result=result),
+                                         10.05, W, H)
+        np.testing.assert_allclose(inp.bbox, bbox)  # index 1 = the target's own detection
+        self.assertEqual(len(inp.other_boxes), 1)
+        np.testing.assert_allclose(inp.other_boxes[0], other)
 
     def test_target_missing_from_result(self):
         pipeline, _ = self.fake_pipeline(tracked_ids=(7,), usable=False)
